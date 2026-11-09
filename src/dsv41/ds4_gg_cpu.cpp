@@ -96,6 +96,124 @@ void gg_cpu_set_iq256(int mode) { g_iq256 = mode; }
 // microcode - 1.8 GB/s against these rows' 33 GB/s on an EPYC 7452 (a 2.00 set decodes 3x slower on one card), 19-31 GB/s on Intel.
 // The rows are bit-identical, so taking them at every token count only changes the speed.
 static int min_tokens(int type) { return type == 21 ? 1 : type == 29 ? 1 : 2; }
+// the CPU's AVX2/FMA/F16C answer, asked once.  Everything that can reach the AVX2 rows (or their own_ok() probe) must be
+// behind this: iq256x_rows is the AVX2 implementation and its header says the caller checks support, and the portable build's
+// stub is an abort.  DS4_GG_SIMULATE_NO_AVX2=1 answers false, so the unsupported path can be exercised on a machine that has
+// AVX2 - that is how the guard is tested, not assumed.
+static bool avx2_ok_here() {
+    static const bool ok = [] {
+        const char* v = std::getenv("DS4_GG_SIMULATE_NO_AVX2");
+        if (v != nullptr && std::atoi(v) != 0) return false;
+        return ggml_cpu_has_avx2() && ggml_cpu_has_fma() && ggml_cpu_has_f16c();
+    }();
+    return ok;
+}
+
+// IQ1_M's rows against ggml-cpu's own dot, measured on THIS CPU once at startup.  The comment above records 19-31 GB/s for
+// the rows on Intel, but not everywhere: on the Broadwell-EP of the 4x 2080 Ti box the rows run 14.6 GB/s against ggml's
+// 22.3, and taking ggml's dot there is worth 7% of a decode token (128 tokens at 32K: 4,583 -> 4,261 ms, both bit-identical
+// through own_ok).  So the choice is measured rather than assumed by CPU name: DS4_GG_IQ1M=auto (default) times both,
+// =own or =ggml forces one.  It can only change speed - the bits are compared before either is taken.
+static int g_iq1m = -1;   // 1 these rows, 0 ggml's dot
+static int g_iq1m_own_from = 1;   // the token count at which these rows take over (measured)
+static int pick_iq1m() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const char* v = std::getenv("DS4_GG_IQ1M");
+        if (v != nullptr && (*v == '0' || std::strcmp(v, "ggml") == 0)) { g_iq1m = 0; g_iq1m_own_from = 1 << 20; return; }
+        if (v != nullptr && (*v == '1' || std::strcmp(v, "own") == 0)) { g_iq1m = 1; g_iq1m_own_from = 1; return; }
+        if (!avx2_ok_here() || !strata::kernels::cpu::iq256x_supported(29)) {   // (no AVX2: ggml's dot, never the rows)
+            g_iq1m = 0;
+            g_iq1m_own_from = 1 << 20;
+            return;
+        }
+        constexpr int type = 29, n = 2304, rows = 16384;   // (9.4 MB a pass: one expert's worth, ~0.5 ms a path)
+        const ggml_type_traits_cpu* tc = ggml_get_type_traits_cpu((ggml_type) type);
+        const ggml_type_traits_cpu* q8 = tc != nullptr ? ggml_get_type_traits_cpu(tc->vec_dot_type) : nullptr;
+        if (tc == nullptr || tc->vec_dot == nullptr || q8 == nullptr || q8->from_float == nullptr) { g_iq1m = 1; return; }
+        const size_t rb = ggml_row_size((ggml_type) type, n), bb = ggml_type_size((ggml_type) type), ab = ggml_row_size(tc->vec_dot_type, n);
+        uint64_t st = 0x9E3779B97F4A7C15ull + (uint64_t) type;
+        auto next = [&st] { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+        std::vector<uint8_t> w(rb * rows);
+        for (auto& b : w) b = (uint8_t) next();
+        for (size_t o = 0; o < w.size(); o += bb) {   // IQ1_M keeps its f16 in the top nibbles of the four scale words
+            const ggml_fp16_t d = ggml_fp32_to_fp16(0.002f + 0.001f * (float) (next() % 16));
+            uint16_t sc[4];
+            std::memcpy(sc, &w[o + 48], 8);
+            for (int j = 0; j < 4; ++j) sc[j] = (uint16_t) ((sc[j] & 0x0fff) | ((d >> (4 * j)) & 0xf) << 12);
+            std::memcpy(&w[o + 48], sc, 8);
+        }
+        std::vector<uint8_t> a(ab);
+        std::vector<float> x((size_t) n), o((size_t) rows);
+        for (auto& v : x) v = ((float) (next() % 2001) - 1000.0f) * 1e-3f;
+        q8->from_float(x.data(), a.data(), n);
+        const void* ap[1] = {a.data()};
+        float* op[1] = {o.data()};
+        double best_g = 1e30, best_o = 1e30;
+        for (int round = 0; round < 4; ++round) {
+            auto t0 = std::chrono::steady_clock::now();
+            for (int r = 0; r < rows; ++r) tc->vec_dot(n, &o[(size_t) r], 0, w.data() + (size_t) r * rb, 0, ap[0], 0, 1);
+            const double tg = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            t0 = std::chrono::steady_clock::now();
+            strata::kernels::cpu::iq256x_rows(type, w.data(), rb, n, ap, 1, op, 0, rows);
+            const double to = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (round > 0) { best_g = std::min(best_g, tg); best_o = std::min(best_o, to); }   // (round 0 warms)
+        }
+        // the rows amortise a block's decode across tokens and ggml's dot does not, so the two cross over: measured on this
+        // box at 14 threads, ggml's dot is 20.6 GB/s against these rows' 13.9 at one token (x0.67), dead level at 2-3
+        // (x0.92), and these rows win from 4 tokens on (x1.28) and by x1.52 at 6 - which is the shape a draft verify
+        // window runs.  So both are measured at 1 and at 6 tokens here and the crossover is taken from that: the engine
+        // then uses ggml's dot below it and these rows at or above it, i.e. the faster of the two at every token count.
+        const int nt_hi = 6;
+        std::vector<std::vector<uint8_t>> ah((size_t) nt_hi, std::vector<uint8_t>(ab));
+        std::vector<const void*> aph((size_t) nt_hi);
+        std::vector<float> oh((size_t) rows);
+        std::vector<float*> oph((size_t) rows, oh.data());
+        for (int t = 0; t < nt_hi; ++t) {
+            std::vector<float> xt((size_t) n);
+            for (auto& v2 : xt) v2 = ((float) (next() % 2001) - 1000.0f) * 1e-3f;
+            q8->from_float(xt.data(), ah[(size_t) t].data(), n);
+            aph[(size_t) t] = ah[(size_t) t].data();
+        }
+        double b1g = 1e30, b1o = 1e30, b6g = 1e30, b6o = 1e30;
+        for (int round = 0; round < 3; ++round) {
+            auto t0 = std::chrono::steady_clock::now();
+            for (int r = 0; r < rows; ++r) tc->vec_dot(n, &oh[(size_t) r], 0, w.data() + (size_t) r * rb, 0, aph[0], 0, 1);
+            const double g1 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            t0 = std::chrono::steady_clock::now();
+            strata::kernels::cpu::iq256x_rows(type, w.data(), rb, n, aph.data(), 1, oph.data(), 0, rows);
+            const double o1 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            t0 = std::chrono::steady_clock::now();
+            for (int r = 0; r < rows; ++r)
+                for (int t = 0; t < nt_hi; ++t) tc->vec_dot(n, &oh[(size_t) r], 0, w.data() + (size_t) r * rb, 0, aph[(size_t) t], 0, 1);
+            const double g6 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            t0 = std::chrono::steady_clock::now();
+            strata::kernels::cpu::iq256x_rows(type, w.data(), rb, n, aph.data(), nt_hi, oph.data(), 0, rows);
+            const double o6 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (round > 0) {
+                b1g = std::min(b1g, g1); b1o = std::min(b1o, o1);
+                b6g = std::min(b6g, g6); b6o = std::min(b6o, o6);
+            }
+        }
+        // own at 6, ggml at 1: the crossover the measurements imply on this CPU (4 tokens on this box)
+        // the crossover is not usable in the engine: the lane's calls are ~2 experts of 64 rows, far smaller than the
+        // bench's stream, and at that size the rows' advantage at 6 tokens does not materialise (measured: a 4-token
+        // threshold cost 6.1% decode against taking ggml's dot outright, /tmp/hyb-ab.log).  So the rule is: take the
+        // rows only when they already win at ONE token, otherwise ggml's dot throughout.
+        g_iq1m_own_from = b1o < b1g ? 1 : (1 << 20);
+        g_iq1m = g_iq1m_own_from <= 1 ? 1 : 0;
+        std::fprintf(stderr,
+                     "ds4: CPU lane IQ1_M: ggml's dot %.2f ms against these rows %.2f at 1 token, %.2f against %.2f at 6 -> "
+                     "%s (bit-identical)\n",
+                     b1g, b1o, b6g, b6o,
+                     g_iq1m_own_from <= 1
+                         ? "these rows at every token count"
+                         : "ggml's dot at every token count (the rows' 6-token win does not survive the lane's small calls: a "
+                           "per-token-count threshold cost 6.1% end to end, so it is not used)");
+    });
+    return g_iq1m;
+}
+static int pick_iq1m_threshold() { (void) pick_iq1m(); return g_iq1m_own_from; }
 static bool own_ok(int type, int impl) {
     static std::once_flag once[2][32];
     static bool ok[2][32];
@@ -201,10 +319,13 @@ static bool want_512(int type, int nt) {
 }
 // 0: ggml-cpu's dot, 1: the AVX2 rows, 2: the AVX-512 rows
 static int use_iq256(int type, int nt) {
+    if (type == 29 && avx2_ok_here() && strata::kernels::cpu::iq256x_supported(29) && own_ok(29, 0) &&
+        nt < pick_iq1m_threshold())
+        return 0;   // (measured on this CPU, and only where the rows can actually run)
     if (g_iq256 < 0) {
         const char* v = std::getenv("DS4_GG_IQ256");
         // (ggml-cpu's own answer: built with AVX2 + FMA + F16C, which is also what makes its dots the AVX2 ones these rows match)
-        const bool avx2 = ggml_cpu_has_avx2() && ggml_cpu_has_fma() && ggml_cpu_has_f16c();
+        const bool avx2 = avx2_ok_here();
         g_iq256 = !avx2 ? 0 : v == nullptr ? 2 : std::atoi(v) != 0 ? 1 : 0;
     }
     if (g_iq256 == 0) return 0;

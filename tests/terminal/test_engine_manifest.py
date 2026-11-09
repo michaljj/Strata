@@ -249,8 +249,8 @@ class Arch(unittest.TestCase):
         linux = re.search(r"^ARCH=\$\{ARCH:-([^}]+)\}", sh, re.M).group(1)
         windows = re.search(r'set "DSV41_ARCH=([^"]+)"', bat).group(1)
         self.assertEqual(linux, windows, "Windows and Linux ship the same DeepSeek architectures")
-        self.assertEqual(package_archs(linux), ["sm_86", "sm_89", "sm_120", "compute_120"])
-        self.assertIn('set(CMAKE_CUDA_ARCHITECTURES "86-real;89-real;120" CACHE', cmake)
+        self.assertEqual(package_archs(linux), ["sm_75", "sm_86", "sm_89", "sm_120", "compute_120"])
+        self.assertIn('set(CMAKE_CUDA_ARCHITECTURES "75-real;86-real;89-real;120" CACHE', cmake)
 
         def package(archs):
             return feed.EnginePackage(version="0.1.50", platform="linux-x86_64", backend="cuda", variant="cuda13", archs=tuple(archs),

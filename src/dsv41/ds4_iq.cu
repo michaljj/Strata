@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1731,7 +1732,89 @@ void swiglu_f16(const float* gu, int ld, int n, int ff, float limit, uint16_t* h
     strata_ds4_launch(swiglu_f16_kernel, grid_for((long long) n * ff), kThreads, 0, s, gu, ld, n, ff, limit, h, ldh);
 }
 
+// DS4_MVSTAT=1: diagnostics only (off by default, the default path is unchanged).  Records where this file's matvec
+// dispatch spends its time, bucketed by the widest ncol in a call, plus a job histogram by ncol and by quantisation
+// type.  Every dispatch of the process is accumulated and the table is printed at exit, so the caller divides by the
+// engine's own decode milliseconds (a prompt run would mix the two).
+#if !defined(STRATA_METAL)
+namespace {
+struct MvStatEv { cudaEvent_t a, b; int bucket; };
+struct MvStat {
+    std::mutex mu;
+    std::vector<MvStatEv> ev;
+    long long calls[17] = {};
+    long long jobs[17] = {};
+    long long by_type[64] = {};   // jobs by quantisation type (DS4_MVSTAT, diagnostics)
+    bool registered = false;
+    void report() {
+        std::vector<MvStatEv> mine;
+        { std::lock_guard<std::mutex> lk(mu); mine.swap(ev); }
+        cudaDeviceSynchronize();
+        double ms[17] = {};
+        for (const MvStatEv& e : mine) {
+            float f = 0;
+            if (cudaEventElapsedTime(&f, e.a, e.b) == cudaSuccess) ms[e.bucket & 15] += f;
+            cudaEventDestroy(e.a);
+            cudaEventDestroy(e.b);
+        }
+        double tot = 0;
+        for (double v : ms) tot += v;
+        long long tc = 0, tj = 0;
+        for (int c = 1; c <= 16; ++c) { tc += calls[c]; tj += jobs[c]; }
+        std::fprintf(stderr, "ds4 mvstat: %.1f ms over %lld calls (%lld jobs)\n", tot, tc, tj);
+        for (int c = 1; c <= 16; ++c)
+            if (calls[c] || jobs[c])
+                std::fprintf(stderr, "ds4 mvstat  max_ncol %-2d calls %6lld jobs %7lld %8.2f ms %5.1f%%\n",
+                             c, calls[c], jobs[c], ms[c], tot > 0 ? 100.0 * ms[c] / tot : 0.0);
+        for (int t = 0; t < 64; ++t)
+            if (by_type[t]) std::fprintf(stderr, "ds4 mvstat  type %-2d jobs %7lld\n", t, by_type[t]);
+    }
+};
+MvStat g_mvstat;
+struct MvScope {
+    bool on;
+    cudaEvent_t a = nullptr, b = nullptr;
+    int bucket = 1;
+    cudaStream_t s;
+    explicit MvScope(cudaStream_t st) : on(g_mvstat.registered), s(st) {}
+    ~MvScope() {
+        if (!on) return;
+        cudaEventRecord(b, s);
+        std::lock_guard<std::mutex> lk(g_mvstat.mu);
+        g_mvstat.ev.push_back({a, b, bucket});
+    }
+};
+}  // namespace
+#endif
+
 bool mv(const MvJob* jobs, int n, cudaStream_t s) {
+#if !defined(STRATA_METAL)
+    MvScope _mvs(s);
+    if (std::getenv("DS4_MVSTAT") != nullptr && !g_mvstat.registered) {
+        std::lock_guard<std::mutex> lk(g_mvstat.mu);
+        if (!g_mvstat.registered) {
+            g_mvstat.registered = true;
+            std::atexit(+[] { g_mvstat.report(); });
+        }
+    }
+    _mvs.on = g_mvstat.registered;
+    if (_mvs.on) {
+        int maxc = 1;
+        for (int i = 0; i < n; ++i) maxc = std::max(maxc, jobs[i].ncol);
+        _mvs.bucket = std::min(16, maxc);
+        {
+            std::lock_guard<std::mutex> lk(g_mvstat.mu);
+            ++g_mvstat.calls[_mvs.bucket];
+            for (int i = 0; i < n; ++i) {
+                ++g_mvstat.jobs[std::min(16, std::max(1, jobs[i].ncol))];
+                if (jobs[i].type >= 0 && jobs[i].type < 64) ++g_mvstat.by_type[jobs[i].type];
+            }
+        }
+        cudaEventCreateWithFlags(&_mvs.a, cudaEventDefault);
+        cudaEventCreateWithFlags(&_mvs.b, cudaEventDefault);
+        cudaEventRecord(_mvs.a, s);
+    }
+#endif
 #if defined(STRATA_METAL)
     if (n > 0 && n <= 64 && ::strata::dsv41::metal_host::iq_mv((const void*) jobs, n)) return true;
 #endif

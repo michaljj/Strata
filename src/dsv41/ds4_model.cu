@@ -1686,7 +1686,12 @@ struct Model::Impl {
     // DS4_PROF: the experts' kernels alone, by type (events around the gate/up and down calls of run_set)
     struct EkMark {
         cudaEvent_t e0, e1, e2;
+        // the busy experts (FAT) alone, inside e1..e2: e3->e4 brackets their gate/up loop, e5->e6 their down loop.  Null when this
+        // call had no FAT expert, which is every call in a run with DS4_FAT_ROWS=0 and every non-MXFP4 layer.
+        cudaEvent_t e3, e4, e5, e6;
         int tg, td, nrows, nexp, maxrows, dev, ff;
+        int fat_exp;             // experts this call gave to the FAT path
+        long long fat_rows_sum;  // their rows together
     };
     std::vector<EkMark> ek_marks;
     std::map<int, std::vector<cudaEvent_t>> ek_pool;   // by device
@@ -1702,6 +1707,15 @@ struct Model::Impl {
         cudaEvent_t e = nullptr;
         cudaEventCreate(&e);
         return e;
+    }
+    void ek_give_back(EkMark& m) {   // an early error leaves the run: give this call's events back before it
+        std::lock_guard<std::mutex> lk(prof_mu);
+        cudaSetDevice(m.dev);
+        for (cudaEvent_t e : {m.e0, m.e1, m.e2, m.e3, m.e4, m.e5, m.e6})
+            if (e != nullptr) {
+                cudaEventSynchronize(e);   // a recycled event must not still be in flight
+                ek_pool[m.dev].push_back(e);
+            }
     }
     void prof_mark(const Dev& d, int stage) {
         if (ds4_dbg("DS4_TLOG")) {   // the host's own phase times (what the GPU meters do not see)
@@ -4090,7 +4104,8 @@ struct Model::Impl {
                 const int base = c.A;
                 // one rule (ds4_experts_rule.hpp: attn_slab_rows): the chunk's whole slab (<= 1024 rows) where the cards hold half the
                 // experts or more (4 x R9700, +9% prompt), up to 2048 rows where the VRAM is spare, the base otherwise
-                c.A = strata::ds4::attn_slab_rows(env, chunk, base, spare, bpr, rdna4() ? share : 0.0, defaults_026());
+                c.A = strata::ds4::attn_slab_rows(env, chunk, base, spare, bpr, rdna4() ? share : 0.0, defaults_026(),
+                                                  strata::ds4::defaults_075());
                 if (env < 0 && c.A > base) {
                     slab_auto_grew_ = true;
                     if (di == 0 && o.verbose) {
@@ -4206,7 +4221,8 @@ struct Model::Impl {
     //  RTX 5090, ISTA-DAS 2.25 bpw: a 13K-token prompt 1,400 -> 1,625 tok/s at 64 rows, decode unchanged)
     static int fat_rows() {
         static const int n = [] {
-            const int v = std::getenv("DS4_FAT_ROWS") ? std::max(0, std::atoi(std::getenv("DS4_FAT_ROWS"))) : 0;
+            const int v = std::getenv("DS4_FAT_ROWS") ? std::max(0, std::atoi(std::getenv("DS4_FAT_ROWS")))
+                                                      : (strata::ds4::defaults_075() ? 64 : 0);   // 075: 64 rows, the measured profile
             return v > 0 ? std::max(v, 17) : 0;   // (the light kernels take the experts of 16 rows or fewer)
         }();
         return n;
@@ -5010,11 +5026,19 @@ struct Model::Impl {
                 }
                 EkMark ek{};
                 const bool ekp = prof_chunk;
+                ek.fat_exp = (int) fat.size();
+                for (const int i : fat) ek.fat_rows_sum += b[i + 1] - b[i];
                 if (ekp) {
                     std::lock_guard<std::mutex> lk(prof_mu);
                     ek.e0 = ek_ev();
                     ek.e1 = ek_ev();
                     ek.e2 = ek_ev();
+                    if (!fat.empty()) {   // (only when FAT runs: four more events per call are not free)
+                        ek.e3 = ek_ev();
+                        ek.e4 = ek_ev();
+                        ek.e5 = ek_ev();
+                        ek.e6 = ek_ev();
+                    }
                     ek.tg = gg::expert_type(sa.lay, 0);
                     ek.td = gg::expert_type(sa.lay, 2);
                     ek.nrows = nrows;
@@ -5026,16 +5050,24 @@ struct Model::Impl {
                 }
                 if (sa.lay.fmt == gg::kFmtMXFP4) {
                     gg::set_gate_up(sa, c.x, D, c.row_tok + a, c.h16, FF, d.st);
+                    if (ek.e3 != nullptr) cudaEventRecord(ek.e3, d.st);
                     for (const int i : fat)
                         if (!fat_gate_up(c, sa, sa.wbase + (size_t) (i - i0) * stride, b[i], b[i + 1] - b[i], a, D, FF,
-                                         d.st, err))
+                                         d.st, err)) {
+                            if (ekp) ek_give_back(ek);
                             return false;
+                        }
+                    if (ek.e4 != nullptr) cudaEventRecord(ek.e4, d.st);
                     if (ekp) cudaEventRecord(ek.e1, d.st);
                     gg::set_down(sa, c.h16, FF, c.y, D, d.st);
+                    if (ek.e5 != nullptr) cudaEventRecord(ek.e5, d.st);
                     for (const int i : fat)
                         if (!fat_down(c, sa, sa.wbase + (size_t) (i - i0) * stride, b[i] - a, b[i + 1] - b[i], D, FF,
-                                      d.st, err))
+                                      d.st, err)) {
+                            if (ekp) ek_give_back(ek);
                             return false;
+                        }
+                    if (ek.e6 != nullptr) cudaEventRecord(ek.e6, d.st);
                 } else {
                     x3::set_gate_up(sa, c.x, D, c.row_tok + a, c.h16, FF, d.st);
                     if (ekp) cudaEventRecord(ek.e1, d.st);
@@ -8167,7 +8199,7 @@ struct Model::Impl {
 #endif
     void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
         constexpr int RB = 64;   // rows a job
-        const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
+const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
         const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
         gg::IqCpu fm;
         std::string ferr;
@@ -8243,10 +8275,27 @@ struct Model::Impl {
                 }
         }
         double tq1 = now_ms(); if (cpulog) t_q1 += tq1 - tp1;
+        // DS4_LANE_T: diagnostics only (off by default, the default path is unchanged) - the per-call sum of the task
+        // bodies themselves, so the wall time of run_nodes can be split into work and into the dispatch/wait around it.
+        static const bool lt_on = std::getenv("DS4_LANE_T") != nullptr;
+        // (every worker of every pool adds these, so they are atomics: nanoseconds as integers, exact and lock-free,
+        // instead of a double that two workers can lose an add on)
+        static std::atomic<long long> lt_gate_ns{0}, lt_down_ns{0};
+        static std::atomic<long> lt_gt{0}, lt_dt{0}, lt_n{0}, lt_tok{0};
         std::function<void(int)> f[4];
+        // DS4_LANE_FUSE: the h quantisation of an expert runs inside the gate/up dispatch, on the worker that finishes its
+        // last part, instead of after a barrier - so the quantisation of the experts already done overlaps the gate/up of
+        // the ones still running, and the pool never idles between the two phases.  Bit-identical: the quantisation of an
+        // expert depends only on that expert's own h rows, and run_nodes' end still orders it before the down dispatch.
+        // default on (measured -3.2% decode at 32K: 4206 -> 4072 ms median over two interleaved pairs); DS4_LANE_FUSE=0 turns it off
+        static const bool fuse = [] { const char* v = std::getenv("DS4_LANE_FUSE"); return v == nullptr || (std::atoi(v) != 0); }();
+        std::vector<std::atomic<int>> parts_done((size_t) ne);
+        for (auto& c : parts_done) c.store(0, std::memory_order_relaxed);
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / GB] : j / GB)];
+                const double lt0 = lt_on ? now_ms() : 0.0;
+                const int ei = ord != nullptr ? ord[j / GB] : j / GB;
+                const Ent& en = ents[(size_t) ei];
                 const int r0 = X * FFh + (j % GB) * RB, r1 = std::min(X * FFh + FFh, r0 + RB);
                 const void* ap[kEntMax];
                 float* hp[kEntMax];
@@ -8258,16 +8307,54 @@ struct Model::Impl {
                 // block size of the type)
                 gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
                                    r0 - X * FFh, r1 - X * FFh, lim);
+                if (fuse && parts_done[(size_t) ei].fetch_add(1, std::memory_order_acq_rel) + 1 == NH * GB) {
+                    for (int i = 0; i < en.n; ++i)   // (this expert's last part: its h rows are whole now)
+                        gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
+                                         aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+                }
+                if (lt_on) {
+                    lt_gate_ns.fetch_add((long long) ((now_ms() - lt0) * 1e6), std::memory_order_relaxed);
+                    lt_gt.fetch_add(1, std::memory_order_relaxed);
+                }
             };
         run_nodes(ne * GB, f);
         double tr1 = now_ms(); if (cpulog) t_r1 += tr1 - tq1;
-        for (const Ent& en : ents)
-            for (int i = 0; i < en.n; ++i)
-                gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
-                                 aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+        if (fuse && std::getenv("DS4_LANE_FUSE_SELFCHECK") != nullptr) {
+            // the fused quantisation is compared against the unfused one on this very call: every expert's h rows are
+            // re-quantised the old way into a scratch row and memcmp'd with what the dispatch wrote.  Exit code 3 on any
+            // difference, so the gate is a real bit comparison rather than an argument about the rows being independent.
+            static long checked = 0, bad = 0;
+            std::vector<uint32_t> ref((size_t) E * 4 / 4);
+            for (const Ent& en : ents)
+                for (int i = 0; i < en.n; ++i) {
+                    std::fill(ref.begin(), ref.end(), 0u);
+                    gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF, ref.data());
+                    const uint32_t* got = (const uint32_t*) (aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+                    if (std::memcmp(ref.data(), got, (size_t) E * 4) != 0) {
+                        if (bad++ == 0) std::fprintf(stderr, "ds4: LANE_FUSE SELFCHECK MISMATCH (expert %d, row %d)\n", en.e, i);
+                    }
+                    ++checked;
+                }
+            static bool reg_sc = false;
+            if (!reg_sc) {
+                reg_sc = true;
+                std::atexit([] {
+                    std::fprintf(stderr, "ds4: LANE_FUSE SELFCHECK: %ld rows compared against the unfused quantisation, %ld differ\n",
+                                 checked, bad);
+                    if (bad != 0) std::_Exit(3);
+                });
+            }
+        }
+        if (!fuse) {
+            for (const Ent& en : ents)
+                for (int i = 0; i < en.n; ++i)
+                    gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
+                                     aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+        }
         double tq2 = now_ms(); if (cpulog) t_q2 += tq2 - tr1;
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
+                const double lt0 = lt_on ? now_ms() : 0.0;
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
                 const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
                 const void* hp[kEntMax];
@@ -8277,6 +8364,10 @@ struct Model::Impl {
                     yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
                 }
                 gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+                if (lt_on) {
+                    lt_down_ns.fetch_add((long long) ((now_ms() - lt0) * 1e6), std::memory_order_relaxed);
+                    lt_dt.fetch_add(1, std::memory_order_relaxed);
+                }
             };
         run_nodes(ne * DB, f);
         if (cpulog) t_r2 += now_ms() - tq2;
@@ -8288,6 +8379,32 @@ struct Model::Impl {
                 acc[0] += tq1 - tp0; acc[1] += tr1 - tq1; acc[2] += tq2 - tr1; acc[3] += te - tq2; acc[4] += 1; acc[5] += ne;
                 if (((long long) acc[4]) % 1000 == 0)
                     std::fprintf(stderr, "ds4 prof CPU lane (IQ rows) per call: n %.0f, entries/call %.2f, prep %.3f ms, gate+up %.3f ms, h-quant %.3f ms, down %.3f ms\n", acc[4], acc[5] / acc[4], acc[0] / acc[4], acc[1] / acc[4], acc[2] / acc[4], acc[3] / acc[4]);
+            }
+        }
+        if (lt_on) {   // DS4_LANE_T: the wall of run_nodes against the task bodies it ran (threads = every pool's size)
+            static double wg = 0, wd = 0;
+            const double te = now_ms();
+            wg += tr1 - tq1; wd += te - tq2;
+            long ntok = 0;
+            for (const Ent& en : ents) ntok += en.n;
+            lt_tok.fetch_add(ntok, std::memory_order_relaxed);
+            const long n = lt_n.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n % 500 == 0) {
+                const int th = NH * (pools.empty() ? 1 : pools[0]->size());
+                const double gw = wg / (double) n, dw = wd / (double) n;
+                const double gns = (double) lt_gate_ns.load(std::memory_order_relaxed);
+                const double dns = (double) lt_down_ns.load(std::memory_order_relaxed);
+                const double gt = (double) lt_gt.load(std::memory_order_relaxed);
+                const double dt = (double) lt_dt.load(std::memory_order_relaxed);
+                const double gb = gt / (double) n, db = dt / (double) n;
+                std::fprintf(stderr,
+                             "ds4 lane split (%ld calls, %d threads, %.2f tokens/call): tasks/call gate %.1f down %.1f | wall ms/call gate "
+                             "%.3f down %.3f | task ms/call gate %.3f down %.3f | busy ms/call (task sum / threads) gate "
+                             "%.3f down %.3f | dispatch+wait gate %.3f down %.3f\n",
+                             n, th, (double) lt_tok.load(std::memory_order_relaxed) / (double) n, gb, db, gw, dw,
+                             gns / 1e6 / (double) n, dns / 1e6 / (double) n,
+                             gns / 1e6 / (double) n / th, dns / 1e6 / (double) n / th,
+                             gw - gns / 1e6 / (double) n / th, dw - dns / 1e6 / (double) n / th);
             }
         }
     }
@@ -13094,6 +13211,8 @@ struct Model::Impl {
                     long calls = 0, rows = 0, experts = 0;
                 };
                 std::map<std::pair<int, int>, Agg> agg;   // (type, role 0 gate+up, 1 down)
+                double fat_ms[2] = {0.0, 0.0};            // role 0 gate+up, 1 down: the busy experts' GEMMs only
+                long fat_calls = 0, fat_exp = 0, fat_rows = 0;
                 {
                     std::lock_guard<std::mutex> lk(prof_mu);
                     for (const EkMark& m : ek_marks) {
@@ -13101,6 +13220,16 @@ struct Model::Impl {
                         cudaSetDevice(m.dev);
                         cudaEventElapsedTime(&a, m.e0, m.e1);
                         cudaEventElapsedTime(&b, m.e1, m.e2);
+                        if (m.e3 != nullptr) {
+                            float fgu = 0, fdn = 0;
+                            cudaEventElapsedTime(&fgu, m.e3, m.e4);
+                            cudaEventElapsedTime(&fdn, m.e5, m.e6);
+                            fat_ms[0] += fgu;
+                            fat_ms[1] += fdn;
+                            ++fat_calls;
+                            fat_exp += m.fat_exp;
+                            fat_rows += (long) m.fat_rows_sum;
+                        }
                         Agg& x = agg[{m.tg, 0}];
                         x.ms += a;
                         x.flops += 2.0 * 2.0 * m.nrows * (double) g.dim * (double) m.ff;
@@ -13112,6 +13241,12 @@ struct Model::Impl {
                         ek_pool[m.dev].push_back(m.e0);
                         ek_pool[m.dev].push_back(m.e1);
                         ek_pool[m.dev].push_back(m.e2);
+                        if (m.e3 != nullptr) {
+                            ek_pool[m.dev].push_back(m.e3);
+                            ek_pool[m.dev].push_back(m.e4);
+                            ek_pool[m.dev].push_back(m.e5);
+                            ek_pool[m.dev].push_back(m.e6);
+                        }
                     }
                     ek_marks.clear();
                 }
@@ -13126,6 +13261,34 @@ struct Model::Impl {
                                  kv.second.experts > 0 ? (double) kv.second.rows / (double) kv.second.experts : 0.0,
                                  kv.second.ms > 0 ? kv.second.flops / kv.second.ms / 1e9 : 0.0);
                 std::fprintf(stderr, "ds4 prof  expert kernels total %.1f ms\n", tot);
+                // The busy experts' share of that total (5.5): the tiled figures are the same totals minus the FAT spans, so the
+                // two add up; "other/waits" is what neither bracket covers (stream waits, launch gaps, the combine) and is not
+                // called a wait.  Stage 3 above stays the authoritative whole-experts number.
+                double role_ms[2] = {0.0, 0.0};
+                for (auto& kv : agg) role_ms[kv.first.second] += kv.second.ms;
+                auto tiled = [&](int role) {
+                    double v = role_ms[role] - fat_ms[role];
+                    if (v < 0.0) {
+                        if (v < -0.5)
+                            std::fprintf(stderr, "ds4 prof  FAT bookkeeping error: role %d has %.1f ms of FAT inside %.1f ms\n",
+                                         role, fat_ms[role], role_ms[role]);
+                        v = 0.0;
+                    }
+                    return v;
+                };
+                std::fprintf(stderr, "ds4 prof  expert FAT gate+up %.1f ms  calls %ld  experts %ld  rows %ld  (%.1f rows a call)\n",
+                             fat_ms[0], fat_calls, fat_exp, fat_rows, fat_calls > 0 ? (double) fat_rows / (double) fat_calls : 0.0);
+                std::fprintf(stderr, "ds4 prof  expert FAT down %.1f ms\n", fat_ms[1]);
+                std::fprintf(stderr, "ds4 prof  expert tiled gate+up %.1f ms (the total above minus FAT)\n", tiled(0));
+                std::fprintf(stderr, "ds4 prof  expert tiled down %.1f ms (the total above minus FAT)\n", tiled(1));
+                {
+                    const double fat_all = fat_ms[0] + fat_ms[1], tiled_all = tiled(0) + tiled(1);
+                    std::fprintf(stderr, "ds4 prof  expert FAT share %.1f%% of FAT+tiled, %.1f%% of the experts stage\n",
+                                 fat_all + tiled_all > 0 ? 100.0 * fat_all / (fat_all + tiled_all) : 0.0,
+                                 cprof_ms[3] > 0 ? 100.0 * fat_all / cprof_ms[3] : 0.0);
+                    std::fprintf(stderr, "ds4 prof  expert other/waits %.1f ms (the experts stage minus FAT and tiled)\n",
+                                 std::max(0.0, cprof_ms[3] - fat_all - tiled_all));
+                }
             }
             for (double& v : cprof_ms) v = 0;
             prof_chunk = false;

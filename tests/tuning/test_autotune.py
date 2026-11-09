@@ -507,5 +507,75 @@ class RecheckTest(unittest.TestCase):
         self.assertEqual(out["verdict"], "retune")
 
 
+def nvidia(index=0, cc=75, total=22528):
+    return {"vendor": "nvidia", "index": index, "name": "NVIDIA GeForce RTX 2080 Ti", "compute_cap": cc,
+            "vram_total_mib": total, "vram_used_mib": 100, "driver": "595.91.07"}
+
+
+def machine_ctx(gpus, backend="cuda"):
+    """A context built the way the tuner builds it, with synthetic cards and no probe of the real PC."""
+    return autotune.context_from_config(
+        {"args": list(BASE)}, engine_backend=backend, opts=autotune.Options(),
+        system={"gpus": gpus, "memory": {"total_mib": 65536, "available_mib": 40000},
+                "cpu": {"model": "cpu", "logical": 16, "physical": 8, "hybrid": False}})
+
+
+class TuringContextTest(unittest.TestCase):
+    """The card's compute capability reaches the context and only an eligible CUDA card sees the Turing arm (6.5)."""
+
+    def test_compute_capability_reaches_the_context(self):
+        ctx = machine_ctx([nvidia(0, 75), nvidia(1, 75)])
+        self.assertEqual(ctx.backend, "cuda")
+        self.assertEqual(ctx.nvidia_cc, 75)
+        self.assertTrue(tune_knobs.condition_holds("sm75", ctx))
+
+    def test_turing_arm_is_planned_and_is_exact(self):
+        arms, _ = tune_knobs.plan_arms(machine_ctx([nvidia()]), mode="thorough")
+        by_id = {p.arm.id: p for p in arms}
+        self.assertIn("sm75_series", by_id)
+        self.assertEqual(by_id["sm75_series"].arm.answer, "exact")
+        self.assertEqual(by_id["sm75_series"].env, {"STRATA_SM75_PERF": "1"})
+        self.assertEqual(tune_knobs.check_setting(by_id["sm75_series"].args, by_id["sm75_series"].env,
+                                                 machine_ctx([nvidia()])), [])
+
+    def test_newer_card_skips_the_arm_with_a_reason(self):
+        ctx = machine_ctx([nvidia(0, 86)])
+        self.assertEqual(ctx.nvidia_cc, 86)
+        arms, skipped = tune_knobs.plan_arms(ctx, mode="thorough")
+        self.assertNotIn("sm75_series", {p.arm.id for p in arms})
+        self.assertTrue(any(s["id"] == "sm75_series" and "sm75" in s["reason"] for s in skipped), skipped)
+
+    def test_unreadable_capability_offers_nothing(self):
+        for cc in (None, 0):
+            with self.subTest(cc=cc):
+                ctx = machine_ctx([nvidia(0, cc)])
+                self.assertIsNone(ctx.nvidia_cc)
+                self.assertNotIn("sm75_series",
+                                 {p.arm.id for p in tune_knobs.plan_arms(ctx, mode="thorough")[0]})
+
+    def test_mixed_box_reports_no_single_capability(self):
+        ctx = machine_ctx([nvidia(0, 75), nvidia(1, 86)])
+        self.assertIsNone(ctx.nvidia_cc)
+        self.assertFalse(tune_knobs.condition_holds("sm75", ctx))
+        self.assertNotIn("sm75_series", {p.arm.id for p in tune_knobs.plan_arms(ctx, mode="thorough")[0]})
+
+    def test_non_cuda_backends_are_unchanged(self):
+        hip = machine_ctx([{"vendor": "amd", "index": 0, "name": "Radeon AI PRO R9700", "vram_total_mib": 32768,
+                            "vram_used_mib": 1024, "driver": None}], backend="hip")
+        self.assertEqual(hip.backend, "hip")
+        self.assertIsNone(hip.nvidia_cc)
+        self.assertFalse(tune_knobs.condition_holds("sm75", hip))
+        self.assertNotIn("sm75_series", {p.arm.id for p in tune_knobs.plan_arms(hip, mode="thorough")[0]})
+        cpu = machine_ctx([], backend="cpu")
+        self.assertNotIn("sm75_series", {p.arm.id for p in tune_knobs.plan_arms(cpu, mode="thorough")[0]})
+
+    def test_existing_context_constructions_still_work(self):
+        self.assertIsNone(tune_knobs.Context().nvidia_cc)
+        c = tune_knobs.Context(arch="gfx1030", backend="hip", vram_mib=16000)
+        self.assertEqual(c.arch, "gfx1030")
+        self.assertFalse(tune_knobs.condition_holds("sm75", c))
+        self.assertFalse(tune_knobs.condition_holds("gfx12", c))
+
+
 if __name__ == "__main__":
     unittest.main()

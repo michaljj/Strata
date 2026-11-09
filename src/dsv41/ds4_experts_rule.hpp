@@ -27,6 +27,21 @@ inline bool defaults_026() {
     return on;
 }
 
+// DS4_DEFAULTS=075: the sm_75 profile measured on 4 x RTX 2080 Ti - the busy experts as 64-row FAT GEMMs and a 2048-row attention
+// slab.  It exists because that pair measured faster there: the recorded 2.00 bpw baseline is 423.9 / 671.4 / 764.9 tok/s at 4K /
+// 16K / 32K with FAT off, and FAT 64/1024 with the 2048-row slab is 545.1 / 912.4 / 1044.2 (five --long runs each).  Those two run
+// directories differ in more than these two knobs (split, EXL3 decode, reserve), so quote the pair, never an "increment": the
+// one-knob matrix in docs/DSV41_TUNING_PLAN.md 5.2 is what attributes a gain.  The slab is forced whatever the spare VRAM, which on
+// a card whose spare room is all experts costs memory (this rule's own RTX 5070 record: -3% decode); that is why the profile is
+// opt-in and not automatic.  Every explicit variable still wins (DS4_FAT_ROWS, DS4_ATTN_SLAB), and 026 stays byte-identical.
+inline bool is_075_token(const char* v) {
+    return v != nullptr && (std::strcmp(v, "075") == 0 || std::strcmp(v, "0.7.5") == 0 || std::strcmp(v, "v0.7.5") == 0);
+}
+inline bool defaults_075() {
+    static const bool on = is_075_token(std::getenv("DS4_DEFAULTS"));
+    return on;
+}
+
 constexpr uint64_t kFasterModeVramMax = 16ull << 30;   // GiB of graphics memory in all, at most
 constexpr int kFasterModeExperts = 5;
 
@@ -131,9 +146,12 @@ inline bool store_gpu_shares_ram(bool any_integrated_device, uint64_t avail_befo
 // (the caller passes env 0 there) and DS4_ATTN_SLAB=0 never take either branch.  The caller passes 0 for `expert_share` in a build that is not
 // HIP: that branch is the 4 x R9700 measurement.
 inline int attn_slab_rows(int env, int chunk, int base, double spare_bytes, double bytes_per_row, double expert_share = 0.0,
-                          bool v026 = false) {
+                          bool v026 = false, bool v075 = false) {
     auto clampn = [&](int a) { return std::max(64, std::min(chunk, a) / 64 * 64); };
     if (v026 && env < 0) env = 0;   // 0.2.6: DS4_ATTN_SLAB unset gave the base; DS4_ATTN_SLAB=N still asks for N rows
+    // DS4_DEFAULTS=075: the 2048-row slab measured on 4 x RTX 2080 Ti, whatever the spare room (the 075 profile in the pair above).
+    // env == 0 and env > 0 keep their meaning, so DS4_ATTN_SLAB=0 and =N stay the escape hatches.
+    if (v075 && env < 0) return clampn(2048);
     if (env == 0) return base;
     if (env > 0) return clampn(env);
     int rows = base;
