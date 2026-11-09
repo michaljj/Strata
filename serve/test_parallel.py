@@ -847,6 +847,57 @@ class ParallelStackDefaults(unittest.TestCase):
         self.assertNotIn("STRATA_CKPT_POOL", self.env_for({"parallel": 8, "args": [], "arch": "deepseek41"}))
         self.assertNotIn("STRATA_CKPT_POOL", self.env_for({"parallel": 8, "args": [], "backend": "sycl"}))
 
+    def note_for(self, cfg, env=None, caps=None, linux=True):
+        from unittest import mock
+        with mock.patch.object(server, "parallel_stack_platform", return_value=linux), \
+             mock.patch.object(server, "nvidia_compute_caps", return_value=caps):
+            return server.parallel_stack_note(cfg, env)
+
+    def test_note_names_the_selected_card_class_and_counts_the_switches(self):
+        env = dict(server.PARALLEL_STACK_ENV)
+        note = self.note_for({"parallel": 8, "args": [], "gpu": [0, 1]}, env, caps={0: 75, 1: 75, 2: 86})
+        self.assertIn("sm_75", note)
+        self.assertNotIn("sm_86", note)          # a card this run does not use does not describe it
+        self.assertIn("9 of 9 switches set", note)
+        self.assertIn("active", note)
+
+    def test_note_says_unknown_instead_of_guessing(self):
+        env = dict(server.PARALLEL_STACK_ENV)
+        for caps in (None, {}, {0: 75}):
+            with self.subTest(caps=caps):
+                note = self.note_for({"parallel": 8, "args": [], "gpu": [0, 1]}, env, caps=caps)
+                self.assertIn("GPU compute capability unknown", note)
+                self.assertIn("9 of 9 switches set", note)
+
+    def test_note_counts_only_the_switches_this_run_set(self):
+        env = dict(server.PARALLEL_STACK_ENV)
+        env["STRATA_CKPT_POOL"] = "0"            # setdefault kept the user's own value
+        env["STRATA_QSA_SLOTS"] = "0"
+        note = self.note_for({"parallel": 8, "args": [], "gpu": [0]}, env, caps={0: 75})
+        self.assertIn("7 of 9 switches set", note)
+        self.assertIn("STRATA_CKPT_POOL", note)
+
+    def test_no_note_when_the_stack_is_off(self):
+        env = dict(server.PARALLEL_STACK_ENV)
+        for cfg in ({"args": []}, {"parallel": 1, "args": []}, {"parallel": 8, "args": [], "arch": "deepseek41"},
+                    {"parallel": 8, "args": [], "backend": "hip"}, {"parallel": 8, "args": [], "backend": "sycl"},
+                    {"parallel": 8, "args": [], "backend": "metal"}):
+            self.assertIsNone(self.note_for(cfg, env, caps={0: 75}), cfg)
+        self.assertIsNone(self.note_for({"parallel": 8, "args": []}, env, caps={0: 75}, linux=False))
+
+    def test_the_note_follows_the_same_predicate_as_the_switch(self):
+        from unittest import mock
+        cases = ({"parallel": 8, "args": []}, {"args": ["--batch", "4"]}, {"args": []},
+                 {"parallel": 8, "args": [], "backend": "hip"}, {"parallel": 8, "args": [], "backend": "sycl"},
+                 {"parallel": 8, "args": [], "arch": "deepseek41"}, {"parallel": 2, "args": [], "gpu": [1]})
+        for cfg in cases:
+            with mock.patch.object(server, "parallel_stack_platform", return_value=True), \
+                 mock.patch.object(server, "nvidia_compute_caps", return_value={0: 75, 1: 86}):
+                env = {}
+                server.parallel_stack_env(env, cfg)
+                self.assertEqual(server.parallel_stack_active(cfg), bool(env), cfg)
+                self.assertEqual(server.parallel_stack_note(cfg, env) is not None, bool(env), cfg)
+
 
 class GdnStackDefaults(unittest.TestCase):
     """The qualified GDN speedups are on from the server (Linux CUDA; Linux HIP gfx12 only); an explicit value wins."""

@@ -79,6 +79,12 @@ class Arm:
 
 
 ARMS: tuple[Arm, ...] = (
+    # --- Turing (sm_75): the bitwise kernel series, opt-in and exact ------------------------------------------------------------
+    # STRATA_SM75_PERF is the bitwise series (sm75_series.hpp), so `exact` is the honest class. The classes are named
+    # because plan_arms matches the machine class first: an arm with no classes is never planned. A Turing card is class A
+    # (RAM-bound), B (24 GB and up) or C (under 24 GB, which is a 2080 Ti at 22 GB).
+    Arm("sm75_series", "Use this card's Turing kernels", "exact", env={"STRATA_SM75_PERF": "1"},
+        backends=("cuda",), classes=("A", "B", "C"), needs=("sm75",)),
     # --- long contexts (spec 4.3, 3.3): exact, measured +5.4% decode (5/5) at 128K on the R9700 --------------------------------
     Arm("kv_resident_64k", "Keep more of the conversation in graphics memory", "exact", {"--kv-resident": 65536},
         classes=("A", "B", "C"), backends=("cuda", "hip"), needs=("ctx_ge_128k",)),
@@ -200,7 +206,10 @@ class Context:
     model_gib: float = 0.0
     hybrid_cpu: bool = False
     logical_threads: int = 0
-    arch: str | None = None               # e.g. gfx1201
+    arch: str | None = None               # e.g. gfx1201 (AMD)
+    #: NVIDIA compute capability as one integer (75, 86, 120), None when it could not be read or the selected cards are
+    #: not all the same generation (one integer cannot describe a mixed box)
+    nvidia_cc: int | None = None
     context_tokens: int = 32768
     goal: str = "speed"                   # speed | room
     use: str = "chat"                     # chat | coding
@@ -222,6 +231,7 @@ def condition_holds(name: str, ctx: Context) -> bool:
         "vram_ge_24g": ctx.vram_mib >= 24000,
         "vram_le_8g": 0 < ctx.vram_mib <= 8400,
         "gfx12": bool(ctx.arch and ctx.arch.startswith("gfx12")),
+        "sm75": ctx.backend == "cuda" and ctx.nvidia_cc == 75,
         "windows_amd_kv_stream": ctx.backend == "hip" and sys.platform == "win32" and "--kv-resident" in ctx.base_args,
         "pcie_bound": 0 < ctx.vram_mib < 24000,
         "ram_bound": bool(ctx.ram_gib and ctx.model_gib and ctx.ram_gib - ctx.model_gib < 30),

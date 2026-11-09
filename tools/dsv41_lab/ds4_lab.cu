@@ -182,25 +182,42 @@ static void test_router(int T) {
 // ============================================================================================================ compressor
 static void test_compress(int T, int ratio) {
     const int d = 512; const float eps = 1e-6f;
-    // state pre-filled for the slots before p0; p0 chosen so that the last token of the window completes a group
-    const int p0 = ratio * 3 + (ratio - T);
-    std::vector<float> kv((size_t) T * d), sc((size_t) T * d), kst((size_t) ratio * d), sst((size_t) ratio * d), w(d);
+    // one group per `ratio` tokens, and every group is checked. compress_kernel keeps `val[2]` a thread and runs
+    // 512 threads, so it covers d <= 1024; a T past ratio wraps the slots and emits a latent per wrap.
+    const int TT = std::max(ratio, T / ratio * ratio);
+    if (TT != T) std::printf("  %-20s T=%-5d  compress_win measured at T=%d (whole groups of %d)\n", "compress_win", T, TT, ratio);
+    const int p0 = ratio * 3;
+    std::vector<float> kv((size_t) TT * d), sc((size_t) TT * d), kst((size_t) ratio * d), sst((size_t) ratio * d), w(d);
     for (auto& v : kv) v = nrand(); for (auto& v : sc) v = nrand() * 2.f; for (auto& v : kst) v = nrand(); for (auto& v : sst) v = nrand() * 2.f;
     for (auto& v : w) v = 0.5f + urand();
-    Dev<float> dkv(kv), dsc(sc), dk(kst), ds(sst), dw(w), dlat; dlat.alloc((size_t) d * 2);
-    compress_win(dkv.p, dsc.p, dk.p, ds.p, ratio, p0, T, d, dw.p, eps, dlat.p, g_s); CK(cudaStreamSynchronize(g_s));
+    Dev<float> dkv(kv), dsc(sc), dk(kst), ds(sst), dw(w), dlat;
+    // the pool fires once a completed group: a T larger than ratio produces more than the 2 groups the old allocation
+    // held, and the kernel wrote its latent past the buffer's end (ds4_lab --tokens 17 crashed here, not in attention)
+    const int groups = (p0 + TT + 1) / ratio - p0 / ratio;
+    dlat.alloc((size_t) d * std::max(1, groups));
+    compress_win(dkv.p, dsc.p, dk.p, ds.p, ratio, p0, TT, d, dw.p, eps, dlat.p, g_s); CK(cudaStreamSynchronize(g_s));
     auto lat = dlat.get();
-    // reference: slots (p0+t)%ratio overwritten by the window's tokens, group = all `ratio` slots
+    // reference, replayed group by group: slots (p0+t)%ratio overwritten by the window's tokens, group = all slots
     std::vector<float> k2 = kst, s2 = sst;
-    for (int t = 0; t < T; ++t) { const int slot = (p0 + t) % ratio; for (int e = 0; e < d; ++e) { k2[(size_t) slot * d + e] = kv[(size_t) t * d + e]; s2[(size_t) slot * d + e] = sc[(size_t) t * d + e]; } }
-    std::vector<double> rr(d); double ss = 0;
-    for (int e = 0; e < d; ++e) { double m = -1e300; for (int s = 0; s < ratio; ++s) m = std::max(m, (double) s2[(size_t) s * d + e]);
-        double den = 0; for (int s = 0; s < ratio; ++s) den += std::exp(s2[(size_t) s * d + e] - m);
-        double a = 0; for (int s = 0; s < ratio; ++s) a += (double) k2[(size_t) s * d + e] * std::exp(s2[(size_t) s * d + e] - m) / den; rr[e] = a; ss += a * a; }
-    const double inv = 1.0 / std::sqrt(ss / d + eps); for (int e = 0; e < d; ++e) rr[e] = rr[e] * inv * w[e];
+    std::vector<double> worst(groups, 0.0);
+    int g = 0;
+    for (int t = 0; t < TT; ++t) {
+        const int slot = (p0 + t) % ratio;
+        for (int e = 0; e < d; ++e) { k2[(size_t) slot * d + e] = kv[(size_t) t * d + e]; s2[(size_t) slot * d + e] = sc[(size_t) t * d + e]; }
+        if ((p0 + t + 1) % ratio != 0) continue;
+        std::vector<double> rr(d); double ss = 0;
+        for (int e = 0; e < d; ++e) { double m = -1e300; for (int s = 0; s < ratio; ++s) m = std::max(m, (double) s2[(size_t) s * d + e]);
+            double den = 0; for (int s = 0; s < ratio; ++s) den += std::exp(s2[(size_t) s * d + e] - m);
+            double a = 0; for (int s = 0; s < ratio; ++s) a += (double) k2[(size_t) s * d + e] * std::exp(s2[(size_t) s * d + e] - m) / den; rr[e] = a; ss += a * a; }
+        const double inv = 1.0 / std::sqrt(ss / d + eps); for (int e = 0; e < d; ++e) rr[e] = rr[e] * inv * w[e];
+        std::vector<float> gg(lat.begin() + (size_t) g * d, lat.begin() + (size_t) (g + 1) * d);
+        worst[g] = max_rel(gg, rr);
+        ++g;
+    }
+    double err = 0; for (int gi = 0; gi < g; ++gi) err = std::max(err, worst[gi]);
     char nm[32]; std::snprintf(nm, sizeof nm, "compress_win r=%d", ratio);
-    std::vector<float> gg(lat.begin(), lat.begin() + d);
-    report(nm, T, max_rel(gg, rr), 5e-6, time_us([&] { compress_win(dkv.p, dsc.p, dk.p, ds.p, ratio, p0, T, d, dw.p, eps, dlat.p, g_s); }), "d 512, pooling window");
+    char ex[64]; std::snprintf(ex, sizeof ex, "d 512, %d pooling groups, all checked", g);
+    report(nm, TT, err, 5e-6, time_us([&] { compress_win(dkv.p, dsc.p, dk.p, ds.p, ratio, p0, TT, d, dw.p, eps, dlat.p, g_s); }), ex);
 }
 
 // ============================================================================================================ indexer
@@ -215,34 +232,38 @@ static void test_indexer(int T, int n) {
         for (int g = 0; g < hd / 32; ++g) r[hd / 2 + g] = (uint8_t) (120 + (rnd() % 5));   // 2^-7 .. 2^-3
         for (int e = 0; e < hd; ++e) { const int code = (r[e / 2] >> (4 * (e & 1))) & 15; kdec[(size_t) p * hd + e] = e2m1_val(code) * std::ldexp(1.f, (int) r[hd / 2 + e / 32] - 127); }
     }
-    std::vector<float> q((size_t) T * heads * hd), w((size_t) T * 64, 0.f);
-    for (auto& v : q) v = nrand(); for (int t = 0; t < T; ++t) for (int h = 0; h < heads; ++h) w[(size_t) t * 64 + h] = srand_();
-    Dev<uint8_t> dk(keys); Dev<float> dq(q), dw(w), dout; dout.alloc((size_t) T * n);
+    // index_score / topk take a Rows, which holds kWin (16) entries. The fixtures below write one entry per token,
+    // so past 16 they overflow the struct and the kernel reads garbage limits. The engine only ever feeds a window.
+    const int TT = T > kWin ? kWin : T;
+    if (TT != T) std::printf("  %-20s T=%-5d  indexer measured at the kWin=%d window the struct holds (was T=%d)\n", "index_score", T, kWin, T);
+    std::vector<float> q((size_t) TT * heads * hd), w((size_t) TT * 64, 0.f);
+    for (auto& v : q) v = nrand(); for (int t = 0; t < TT; ++t) for (int h = 0; h < heads; ++h) w[(size_t) t * 64 + h] = srand_();
+    Dev<uint8_t> dk(keys); Dev<float> dq(q), dw(w), dout; dout.alloc((size_t) TT * n);
     Rows lim; for (int t = 0; t < kWin; ++t) { lim.n[t] = n; lim.k[t] = topk_k; }
-    index_score(dq.p, dw.p, dk.p, heads, hd, T, n, nullptr, 0, 1, lim, dout.p, n, g_s); CK(cudaStreamSynchronize(g_s));
+    index_score(dq.p, dw.p, dk.p, heads, hd, TT, n, nullptr, 0, 1, lim, dout.p, n, g_s); CK(cudaStreamSynchronize(g_s));
     auto sc = dout.get();
     std::vector<double> rr; std::vector<float> gg;
-    for (int t = 0; t < T; ++t) for (int p = 0; p < n; p += std::max(1, n / 512)) {
+    for (int t = 0; t < TT; ++t) for (int p = 0; p < n; p += std::max(1, n / 512)) {
         double s = 0; for (int h = 0; h < heads; ++h) { double a = 0; for (int e = 0; e < hd; ++e) a += (double) q[((size_t) t * heads + h) * hd + e] * kdec[(size_t) p * hd + e]; s += std::max(a, 0.0) * w[(size_t) t * 64 + h]; }
         rr.push_back(s); gg.push_back(sc[(size_t) t * n + p]);
     }
     char ex[96]; std::snprintf(ex, sizeof ex, "%d keys, %.1f MB of keys", n, n * (double) rb / 1e6);
-    const double us = time_us([&] { index_score(dq.p, dw.p, dk.p, heads, hd, T, n, nullptr, 0, 1, lim, dout.p, n, g_s); });
-    report("index_score", T, max_rel(gg, rr), 3e-5, us, ex);
+    const double us = time_us([&] { index_score(dq.p, dw.p, dk.p, heads, hd, TT, n, nullptr, 0, 1, lim, dout.p, n, g_s); });
+    report("index_score", TT, max_rel(gg, rr), 3e-5, us, ex);
     // top-512 of the device's own scores: exact set compare
     Rows tr; for (int t = 0; t < kWin; ++t) { tr.n[t] = n; tr.k[t] = std::min(topk_k, n); }
-    Dev<int> dsel; dsel.alloc((size_t) T * topk_k);
-    topk(dout.p, n, T, tr, nullptr, 0, 1, dsel.p, topk_k, g_s); CK(cudaStreamSynchronize(g_s));
+    Dev<int> dsel; dsel.alloc((size_t) TT * topk_k);
+    topk(dout.p, n, TT, tr, nullptr, 0, 1, dsel.p, topk_k, g_s); CK(cudaStreamSynchronize(g_s));
     auto sel = dsel.get(); int bad = 0;
-    for (int t = 0; t < T; ++t) {
+    for (int t = 0; t < TT; ++t) {
         std::vector<int> ord(n); for (int i = 0; i < n; ++i) ord[i] = i;
         std::nth_element(ord.begin(), ord.begin() + topk_k, ord.end(), [&](int a, int b) { return sc[(size_t) t * n + a] > sc[(size_t) t * n + b]; });
         std::vector<char> in(n, 0); for (int i = 0; i < topk_k; ++i) in[ord[i]] = 1;
         const float kth = sc[(size_t) t * n + *std::min_element(ord.begin(), ord.begin() + topk_k, [&](int a, int b) { return sc[(size_t) t * n + a] < sc[(size_t) t * n + b]; })];
         for (int i = 0; i < topk_k; ++i) { const int p = sel[(size_t) t * topk_k + i]; if (p < 0 || p >= n || (!in[p] && sc[(size_t) t * n + p] != kth)) ++bad; }
     }
-    std::snprintf(ex, sizeof ex, "%d wrong picks of %d", bad, T * topk_k);
-    report("topk 512", T, bad ? 1.0 : 0.0, 0.0, time_us([&] { topk(dout.p, n, T, tr, nullptr, 0, 1, dsel.p, topk_k, g_s); }), ex);
+    std::snprintf(ex, sizeof ex, "%d wrong picks of %d", bad, TT * topk_k);
+    report("topk 512", TT, bad ? 1.0 : 0.0, 0.0, time_us([&] { topk(dout.p, n, TT, tr, nullptr, 0, 1, dsel.p, topk_k, g_s); }), ex);
 }
 
 // ============================================================================================================ attention
@@ -266,15 +287,18 @@ static void test_attn(int T, int ncache) {
     for (auto& v : q) v = nrand(); for (auto& v : sink) v = srand_();
     std::vector<int> sel((size_t) T * nsel);
     for (int t = 0; t < T; ++t) for (int i = 0; i < nsel; ++i) sel[(size_t) t * nsel + i] = (int) (rnd() % ncache);
-    AttnRows ar; for (int t = 0; t < kWin; ++t) { ar.win0[t] = t < T ? t + 1 : 0; ar.nwin[t] = nwin; ar.nsel[t] = nsel; }
+    AttnRows ar;
+    ar.gen = 1; ar.t0 = 0; ar.win = nwin; ar.R = 1; ar.kcap = nsel; ar.p0 = nsel - 1;   // (n_win = nwin, n_sel = nsel, any T)
+    for (int t = 0; t < kWin; ++t) { ar.win0[t] = t < T ? t + 1 : 0; ar.nwin[t] = nwin; ar.nsel[t] = nsel; }
     Dev<uint8_t> dck(ckv); Dev<uint16_t> dwin(win); Dev<float> dq(q), dsink(sink), dout; Dev<int> dsel(sel); dout.alloc((size_t) T * heads * d);
     Dev<uint16_t> dscr; dscr.alloc((size_t) kAttnScratchT * (nsel + 8) * d);
     AttnScratch scr; scr.rows = dscr.p; scr.max_t = kAttnScratchT; scr.cap = nsel + 8;
     sparse_attn(dq.p, dwin.p, dck.p, dsel.p, nsel, ar, dsink.p, heads, d, T, scale, dout.p, g_s, kKvFp4, 0, &scr); CK(cudaStreamSynchronize(g_s));
     auto o = dout.get(); std::vector<double> rr; std::vector<float> gg;
+    // (the window base is t + 1 for every t: AttnRows' arrays hold kWin = 16 entries, the gen path does not index them)
     for (int t = 0; t < T; t += std::max(1, T / 2)) for (int h = 0; h < heads; h += 7) {
         std::vector<double> s; std::vector<const float*> rows;
-        for (int j = 0; j < nwin; ++j) rows.push_back(&wdec[(size_t) (ar.win0[t] + j) * d]);
+        for (int j = 0; j < nwin; ++j) rows.push_back(&wdec[(size_t) (t + 1 + j) * d]);
         for (int i = 0; i < nsel; ++i) rows.push_back(&cdec[(size_t) sel[(size_t) t * nsel + i] * d]);
         double m = sink[h];
         for (auto* rw : rows) { double a = 0; for (int e = 0; e < d; ++e) a += (double) q[((size_t) t * heads + h) * d + e] * rw[e]; s.push_back(a * scale); m = std::max(m, s.back()); }
@@ -286,7 +310,7 @@ static void test_attn(int T, int ncache) {
     char ex[96]; std::snprintf(ex, sizeof ex, "64 heads x 512, 128 win + 512 sel, cache %d rows", ncache);
     report("sparse_attn (fp4 ckv)", T, max_rel(gg, rr), 1e-4, time_us([&] { sparse_attn(dq.p, dwin.p, dck.p, dsel.p, nsel, ar, dsink.p, heads, d, T, scale, dout.p, g_s, kKvFp4, 0, &scr); }), ex);
     // split-KV version (tools/dsv41_lab/attn_split.cuh), same inputs
-    {
+    if (T <= 5) {
         const int total = nwin + nsel;
         auto run = [&](const char* nm, auto launch_fn, int R) {
             const int nsplit = (total + R - 1) / R;
@@ -303,6 +327,10 @@ static void test_attn(int T, int ncache) {
         run("attn_split G8 R40", [](auto... a) { strata::ds4lab::sparse_attn_split<8, 40>(a...); }, 40);
         run("attn_split G4 R20", [](auto... a) { strata::ds4lab::sparse_attn_split<4, 20>(a...); }, 20);
         run("attn_split G2 R32", [](auto... a) { strata::ds4lab::sparse_attn_split<2, 32>(a...); }, 32);
+    } else {
+        // the split path is a decode kernel: ds4_kernels.cu:2624 gates it at T <= kSplitMaxT (5) and at
+        // total <= kSplitCap * kSplitR (960 keys). Past that the merge kernel reads rows the partial never wrote.
+        std::printf("  %-20s T=%-5d  skipped: attn_split is the decode path, the engine gates it at T <= 5 and 960 keys\n", "attn_split", T);
     }
     // the packed-rows kernel (no scratch): used from 8 queries on, timed here at this T for comparison
     sparse_attn(dq.p, dwin.p, dck.p, dsel.p, nsel, ar, dsink.p, heads, d, T, scale, dout.p, g_s, kKvFp4, 0, nullptr); CK(cudaStreamSynchronize(g_s));
@@ -361,8 +389,49 @@ static void test_swiglu(int T) {
     report("swiglu clamp 10", T, max_rel(h, rr), 3e-6, time_us([&] { swiglu(dg.p, du.p, n, lim, dh.p, g_s); }), "T x 6 experts x 2304");
 }
 
-int main(int argc, char** argv) {
-    std::vector<int> Ts = {1, 2, 3, 4, 5};
+// ============================================================================================================ rope
+// finish_kernel's rotary part: 4 calls a layer take rd = 64 (32 sincos pairs a row). The question this answers is
+// what the cos/sin table would buy, so the same launch is timed with rd = 64 and with rd = 0 (no rope at all).
+static void test_rope(int T) {
+    const int heads = 64, d = 512, rd = 64, pos = 40000;
+    const int n_vec = T * heads;
+    std::vector<float> x((size_t) n_vec * d), freqs(rd / 2);
+    for (auto& v : x) v = nrand();
+    for (int i = 0; i < rd / 2; ++i) freqs[i] = std::pow(10000.0, -2.0 * i / rd) * (1.0 / (1.0 + i * 0.01));
+    Dev<float> dx(x), df(freqs);
+    // correctness on a fresh copy, one launch only: the timing loop below re-applies the rotation in place, so
+    // comparing against its output would be wrong by the number of repetitions.
+    {
+        Dev<float> dc(x);
+        Finish f; f.rd = rd; f.pos = pos; f.vpp = heads; f.freqs = df.p;
+        finish(dc.p, n_vec, d, d, f, g_s); CK(cudaStreamSynchronize(g_s)); CK(cudaGetLastError());
+        auto got = dc.get();
+        std::vector<double> rr; std::vector<float> gg;
+        for (int e = d - rd; e < d; ++e) {
+            const int i = (e - (d - rd)) >> 1;
+            // the kernel forms the angle in F32, and at pos 40000 that rounding alone moves sin/cos by ~1e-4.
+            // Round the reference's angle the same way, or the comparison measures the argument, not the kernel.
+            const float angf = (float) pos * freqs[i];
+            const double c = std::cos((double) angf), sn = std::sin((double) angf);   // Finish.inverse = 0 => +sinf
+            const double a = x[e], b = x[e ^ 1];
+            rr.push_back(((e - (d - rd)) & 1) == 0 ? a * c - b * sn : b * sn + a * c);
+            gg.push_back(got[e]);
+        }
+        const double err = max_rel(gg, rr);
+        if (err > 1e-4) { report("finish rope", T, err, 1e-4, 0.0, "single launch, row 0"); return; }
+        std::printf("  finish rope          T=%-5d  single launch max rel err %.2e (tol 1e-04) ok\n", T, err);
+    }
+    Finish f; f.rd = rd; f.pos = pos; f.vpp = heads; f.freqs = df.p;
+    auto go = [&] { finish(dx.p, n_vec, d, d, f, g_s); };
+    const double with_rope = time_us(go);
+    Finish f0 = f; f0.rd = 0;
+    const double no_rope = time_us([&] { finish(dx.p, n_vec, d, d, f0, g_s); });
+    char ex[128]; std::snprintf(ex, sizeof ex, "%d rows x %d, rd %d; rope %.1f us, no rope %.1f us => rope costs %.1f us (%.1f%%)",
+                                n_vec, d, rd, with_rope, no_rope, with_rope - no_rope, 100.0 * (with_rope - no_rope) / with_rope);
+    report("finish rope timing", T, 0.0, 0.0, with_rope, ex);
+}
+
+int main(int argc, char** argv) {    std::vector<int> Ts = {1, 2, 3, 4, 5};
     std::string only; int ctx = 8192;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -385,6 +454,7 @@ int main(int argc, char** argv) {
         if (want("attn")) test_attn(T, ncache);
         if (want("engram")) test_engram(T);
         if (want("swiglu")) test_swiglu(T);
+        if (want("rope")) test_rope(T);
         std::printf("\n");
     }
     std::printf("%s (%d failures)\n", g_fails ? "FAILED" : "ALL PARITY OK", g_fails);

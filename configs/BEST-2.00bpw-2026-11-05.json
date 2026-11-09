@@ -1,0 +1,70 @@
+{
+ "exe": "/home/jurek/Strata/build-dsv41/strata-dsv41",
+ "args": [
+  "--pack",
+  "/home/jurek/Strata-data/packs/deepseek-v4.1-flash-ist-das-2.00bpw",
+  "--max-context",
+  "131072",
+  "--eos",
+  "1",
+  "--vision",
+  "on",
+  "--dspark",
+  "auto",
+  "--dspark-conf",
+  "0.5",
+  "--tp",
+  "4",
+  "--experts",
+  "5",
+  "--reserve-mib",
+  "300"
+ ],
+ "cwd": "/home/jurek/Strata",
+ "tokenizer": "/home/jurek/Strata-data/packs/deepseek-v4.1-flash-ist-das-2.00bpw/tokenizer",
+ "model_name": "deepseek-v4.1-flash",
+ "arch": "deepseek41",
+ "log": "/home/jurek/Strata/strata-dsv41-t-best.log",
+ "lib_dirs": [
+  "/home/jurek/Strata/build-dsv41"
+ ],
+ "port": 8080,
+ "engine_ready_s": 3600,
+ "gpu": [
+  0,
+  1,
+  2,
+  3
+ ],
+ "gpus_asked": true,
+ "host": "0.0.0.0",
+ "env": {
+  "DS4_ASYNC_T": "4",
+  "DS4_FAT_ROWS": "64",
+  "DS4_FAT_PIECE": "1024",
+  "DS4_ATTN_SLAB": "2048",
+  "STRATA_GLM_EXL3_DECODE": "new",
+  "STRATA_DS4_DSPARK_CUM": "0.5",
+  "DS4_ATTN_SPLIT": "1"
+ },
+ "args_written": [
+  "--pack",
+  "/home/jurek/Strata-data/packs/deepseek-v4.1-flash-ist-das-2.00bpw",
+  "--max-context",
+  "131072",
+  "--eos",
+  "1",
+  "--vision",
+  "on",
+  "--dspark",
+  "auto",
+  "--dspark-conf",
+  "0.5",
+  "--tp",
+  "4",
+  "--experts",
+  "5",
+  "--reserve-mib",
+  "300"
+ ]
+}

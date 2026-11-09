@@ -9,6 +9,8 @@ using strata::ds4::experts_per_word;
 using strata::ds4::experts_test_override;
 using strata::ds4::copy_all_fits;
 using strata::ds4::attn_slab_rows;
+using strata::ds4::is_026_token;
+using strata::ds4::is_075_token;
 using strata::ds4::staging_ring_mb;
 using strata::ds4::store_gpu_shares_ram;
 
@@ -113,6 +115,29 @@ int main() {
         CHECK_EQ(attn_slab_rows(0, 1024, 256, 1e18, bpr, 0.77), 256);      // DS4_ATTN_SLAB=0: the 0.2.6 rule whatever the share
         CHECK_EQ(attn_slab_rows(512, 1024, 256, 1e18, bpr, 0.77), 512);    // DS4_ATTN_SLAB=N: that many rows whatever the share
         CHECK_EQ(attn_slab_rows(-1, 1024, 1024, -5.0e9, bpr, 0.77), 1024);   // a unified-memory base (32 MB of q = 1024 rows) is kept
+    }
+    // DS4_DEFAULTS=075 (docs/DSV41_TUNING_PLAN.md 5.2): the profile's 2048-row slab, whatever the spare room, with every explicit
+    // variable still winning.  026 stays byte-identical, so a v026 run never takes the 075 row.
+    {
+        const double bpr = 377000.0;
+        CHECK_EQ(is_075_token("075"), 1);
+        CHECK_EQ(is_075_token("0.7.5"), 1);
+        CHECK_EQ(is_075_token("v0.7.5"), 1);
+        CHECK_EQ(is_075_token("026"), 0);
+        CHECK_EQ(is_075_token("0.2.6"), 0);
+        CHECK_EQ(is_075_token(""), 0);
+        CHECK_EQ(is_075_token(nullptr), 0);
+        CHECK_EQ(is_026_token("075"), 0);                                                // 075 does not turn 026 on
+        CHECK_EQ(is_026_token("026"), 1);
+        CHECK_EQ(attn_slab_rows(-1, 8192, 256, -5.0e9, bpr, 0.0, false, true), 2048);     // spare negative: still the 075 slab
+        CHECK_EQ(attn_slab_rows(-1, 8192, 256, 0.0, bpr, 0.0, false, true), 2048);
+        CHECK_EQ(attn_slab_rows(-1, 1024, 256, -5.0e9, bpr, 0.0, false, true), 1024);     // the chunk still caps it
+        CHECK_EQ(attn_slab_rows(-1, 128, 64, -5.0e9, bpr, 0.0, false, true), 128);        // a chunk under 2048 caps it too
+        CHECK_EQ(attn_slab_rows(0, 8192, 256, 1e18, bpr, 0.0, false, true), 256);         // DS4_ATTN_SLAB=0 wins
+        CHECK_EQ(attn_slab_rows(1024, 8192, 256, -5.0e9, bpr, 0.0, false, true), 1024);   // DS4_ATTN_SLAB=N wins
+        CHECK_EQ(attn_slab_rows(-1, 8192, 256, -5.0e9, bpr, 0.0, true, true), 256);       // 026 first: byte-identical even if both are set
+        CHECK_EQ(attn_slab_rows(-1, 8192, 256, -5.0e9, bpr, 0.0, false, false), 256);     // v075 off: today's values
+        CHECK_EQ(attn_slab_rows(-1, 8192, 256, 1e18, bpr, 0.0, false, false), 2048);
     }
     // the staging ring (MB): staging_ring_mb(share, room_bytes, n_dev, integrated, hip)
     {

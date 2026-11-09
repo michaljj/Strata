@@ -1,0 +1,7 @@
+maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]
+           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--profile-readonly] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]
+           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F] [--experts N|auto]
+           [--vision on|off] [--mmap-experts on|off|auto]
+           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve
+           | --encode-image FILE.rgb --size WxH --dump-image OUT
+           | --pack-info)

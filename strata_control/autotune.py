@@ -128,6 +128,9 @@ class TuneResult:
     notes: list[str] = field(default_factory=list)
     classes: list[str] = field(default_factory=list)
     facts: dict[str, Any] = field(default_factory=dict)
+    #: the machine this tune ran on, read once at the start and never changed: cards with their compute capability,
+    #: NVLink/PCIe topology, PCIe link fields and clock/persistence state (each None when the probe could not read it)
+    machine: dict[str, Any] = field(default_factory=dict)
     trials: list[dict[str, Any]] = field(default_factory=list)       # every engine run, for the history store
 
     def to_dict(self) -> dict[str, Any]:
@@ -341,6 +344,8 @@ class Tuner:
     def run(self) -> TuneResult:
         self.started = self.clock()
         r = self.result
+        # reported for reproduction (an asymmetric link or a card class is not visible in a tok/s number), never acted on
+        r.machine = tune_machine.diagnostics()
         try:
             self._run_stages()
         except Cancelled:
@@ -864,6 +869,11 @@ def context_from_config(cfg: dict[str, Any], *, engine_backend: str | None, opts
     cpu = system.get("cpu") or {}
     backend = engine_backend or ("cuda" if any(g.get("vendor") == "nvidia" for g in cards) else
                                  "hip" if any(g.get("vendor") == "amd" for g in cards) else "cpu")
+    # one honest number for the NVIDIA cards the model runs on: None when unreadable or when the used cards are not all
+    # the same generation (a mixed box has no single compute capability to report)
+    ccs = {g["compute_cap"] if isinstance(g.get("compute_cap"), int) and g["compute_cap"] > 0 else None
+           for g in used if g.get("vendor") == "nvidia"}
+    nvidia_cc = ccs.pop() if len(ccs) == 1 else None
     arch = None
     if backend == "hip":
         try:
@@ -875,7 +885,7 @@ def context_from_config(cfg: dict[str, Any], *, engine_backend: str | None, opts
         backend=backend, family=family or detect_family(args), gpu_count=max(1, len(used)),
         vram_mib=min((g["vram_total_mib"] for g in used if g.get("vram_total_mib")), default=0),
         ram_gib=int((mem.get("total_mib") or 0) // 1024), model_gib=model_gib_of(args),
-        hybrid_cpu=bool(cpu.get("hybrid")), logical_threads=int(cpu.get("logical") or 0), arch=arch,
+        hybrid_cpu=bool(cpu.get("hybrid")), logical_threads=int(cpu.get("logical") or 0), arch=arch, nvidia_cc=nvidia_cc,
         context_tokens=ctx_tokens, goal=opts.goal, use=opts.use, allow_placement=opts.allow_placement,
         allow_nonrepeatable=opts.allow_nonrepeatable, engine_flags=engine_flags, base_args=args)
 

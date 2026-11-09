@@ -221,9 +221,9 @@ elseif(STRATA_ENABLE_CUDA)
   set(_strata_cuda_arch_defaulted OFF)
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
     if(STRATA_BUILD_DSV41)
-      # #3935: the DeepSeek engine's own release shape (sm_86, sm_89, sm_120 + PTX 120, as packaging/build_dsv41_cuda.sh), so a hand
-      # build of strata-dsv41 with no architecture runs on an RTX 30, 40 or 50 card; the Qwen engine's default below is unchanged
-      set(CMAKE_CUDA_ARCHITECTURES "86-real;89-real;120" CACHE STRING "CUDA architectures")
+      # #3935: the DeepSeek engine's own release shape (sm_75, sm_86, sm_89, sm_120 + PTX 120, as packaging/build_dsv41_cuda.sh), so a hand
+      # build of strata-dsv41 with no architecture runs on an RTX 20, 30, 40 or 50 card; the Qwen engine's default below is unchanged
+      set(CMAKE_CUDA_ARCHITECTURES "75-real;86-real;89-real;120" CACHE STRING "CUDA architectures")
     else()
       set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures")
     endif()
@@ -2372,6 +2372,13 @@ if(STRATA_NATIVE_EXPERTS)
     # the routed-expert products (MMQ) timed at the prompt path's shapes (16 experts a launch)
     add_executable(mmq_expert_bench src/prefill/mmq_expert_bench.cpp)
     target_link_libraries(mmq_expert_bench PRIVATE strata_mmq ggml-base CUDA::cudart)
+    # the same products at DS4.1's shapes, three ways: the engine's set_tc tiles, MMQ, and a fused probe.
+    # The DS4.1 kernels exist only in a CUDA or HIP build, so the target is added where they do.
+    if(STRATA_BUILD_DSV41 AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_HIP_GFX906))
+      add_executable(ds4_expert_bench tools/dsv41_lab/ds4_expert_bench.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_tq.cu)
+      target_include_directories(ds4_expert_bench PRIVATE src/dsv41 third_party/llama.cpp/ggml/src ${CMAKE_BINARY_DIR}/ggml-tq-overlay)
+      target_link_libraries(ds4_expert_bench PRIVATE strata_dsv41_kernels strata_prefill strata_mmq ggml-base ${_strata_gpu_runtime_target})
+    endif()
   elseif(STRATA_PREFILL_MMQ)
     # Compile only the pinned GGML MMQ and activation-quantizer sources used by prefill. This uses
     # common.cuh's native HIP path without enabling a second GGML HIP backend.

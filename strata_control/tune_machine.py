@@ -74,22 +74,31 @@ def _run(argv: list[str], timeout: float = 10.0) -> str | None:
         return None
 
 
+def compute_cap(text: str | None) -> int | None:
+    """A card's compute capability as one integer: nvidia-smi's ``"7.5"`` gives 75, ``"12.0"`` gives 120. None
+    when the field is missing, ``[N/A]`` or unparseable, so a caller can never mistake it for compute capability 0."""
+    m = re.fullmatch(r"\s*(\d+)\.(\d+)\s*", text or "")
+    return int(m.group(1)) * 10 + int(m.group(2)) if m else None
+
+
 def gpus() -> list[dict[str, Any]]:
     """Graphics cards with their memory: ``name``, ``vram_total_mib``, ``vram_used_mib`` (None when unreadable),
-    ``driver``, ``vendor``. NVIDIA through nvidia-smi, AMD through the kernel's sysfs files; Intel and Apple report
-    their name only where it is known, and leave the memory unreadable."""
+    ``driver``, ``vendor``, and for NVIDIA the card's ``compute_cap`` as one integer (None when unreadable).
+    NVIDIA through nvidia-smi, AMD through the kernel's sysfs files; Intel and Apple report their name only where
+    it is known, and leave the memory unreadable."""
     out: list[dict[str, Any]] = []
     smi = shutil.which("nvidia-smi")
     if smi:
-        text = _run([smi, "--query-gpu=index,name,memory.total,memory.used,driver_version",
+        text = _run([smi, "--query-gpu=index,name,compute_cap,memory.total,memory.used,driver_version",
                      "--format=csv,noheader,nounits"])
         for line in (text or "").splitlines():
             parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 5:
+            if len(parts) >= 6:
                 try:
                     out.append({"vendor": "nvidia", "index": int(parts[0]), "name": parts[1],
-                                "vram_total_mib": int(float(parts[2])), "vram_used_mib": int(float(parts[3])),
-                                "driver": parts[4]})
+                                "compute_cap": compute_cap(parts[2]),
+                                "vram_total_mib": int(float(parts[3])), "vram_used_mib": int(float(parts[4])),
+                                "driver": parts[5]})
                 except ValueError:
                     continue
     if not out and sys.platform.startswith("linux"):
@@ -125,6 +134,87 @@ def gpu_used_mib(indexes: list[int] | None = None) -> int | None:
     vals = [c["vram_used_mib"] for c in cards if c.get("vram_used_mib") is not None
             and (not indexes or c["index"] in indexes)]
     return sum(vals) if vals else None
+
+
+# ------------------------------------------------------- a report of the machine, read only
+
+def _sections(text: str) -> list[dict[str, str]]:
+    """``nvidia-smi -q`` output as one flat key/value dictionary per GPU. The query prints a heading as a line with
+    no colon and indents the values under it, so the indentation decides which headings are still open: ``Clocks``
+    then ``Graphics : 300 MHz`` gives ``clocks_graphics``, and ``PCI`` > ``GPU Link Info`` > ``Link Width`` > ``Max``
+    gives ``pci_gpu_link_info_link_width_max``."""
+    out: list[dict[str, str]] = []
+    for block in re.split(r"^GPU [0-9a-fA-F:.]+\s*$", text or "", flags=re.MULTILINE)[1:]:
+        row: dict[str, str] = {}
+        head: list[tuple[int, str]] = []      # (indent, heading), innermost last
+        for line in block.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            indent = len(line) - len(line.lstrip())
+            while head and head[-1][0] >= indent:
+                head.pop()
+            if ":" not in s:
+                head.append((indent, s))
+                continue
+            key, _, value = s.partition(":")
+            if not value.strip():
+                continue
+            name = "_".join([h for _, h in head] + [key.strip()]).lower().replace(" ", "_")
+            row[name] = value.strip()
+        if row:
+            out.append(row)
+    return out
+
+
+def _query(smi: str, argv: list[str], timeout: float) -> list[dict[str, str]] | None:
+    """One read-only nvidia-smi query as a row per GPU, or None when the tool failed, timed out or printed nothing."""
+    rows = _sections(_run([smi, *argv], timeout=timeout) or "")
+    return rows or None
+
+
+def _pick(rows: list[dict[str, str]], prefixes: tuple[str, ...]) -> list[dict[str, str]] | None:
+    """Only the keys this report names, so a full query does not dump every sensor it prints. None when none of
+    them were readable, so an absent field is never an empty dictionary pretending to be a reading."""
+    out = [{k: v for k, v in row.items() if k.startswith(prefixes)} for row in rows]
+    return [row for row in out if row] or None
+
+
+def _topology(smi: str, timeout: float) -> list[dict[str, Any]] | None:
+    """``nvidia-smi topo -m`` as ``{gpu, links}`` per card, e.g. ``GPU1: NV2``, or None when the query failed."""
+    text = _run([smi, "topo", "-m"], timeout=timeout)
+    if not text:
+        return None
+    lines = [re.sub(r"\x1b\[[0-9;]*m", "", line).strip() for line in text.splitlines()]
+    header = [p for p in (lines[0].split() if lines else []) if re.fullmatch(r"GPU\d+", p)]
+    out: list[dict[str, Any]] = []
+    for line in lines[1:]:
+        parts = line.split()
+        if not header or not parts or parts[0] not in header:
+            continue
+        out.append({"gpu": int(parts[0][3:]), "links": dict(zip(header, parts[1:1 + len(header)]))})
+    return out or None
+
+
+def diagnostics() -> dict[str, Any]:
+    """What a tune report needs to reproduce a number: the cards with their compute capability, the NVLink/PCIe
+    topology, the PCIe link fields and the clock/persistence state. Every probe is read only, and every value it
+    could not read is None with nothing guessed in its place. Nothing here changes a setting on the card."""
+    smi = shutil.which("nvidia-smi")
+    cards = [{"index": g["index"], "name": g["name"], "compute_cap": g.get("compute_cap")}
+             for g in gpus() if g.get("vendor") == "nvidia"]
+    out: dict[str, Any] = {"gpus": cards or None, "topology": None, "pcie": None, "clocks": None}
+    if not smi or not cards:
+        return out
+    out["topology"] = _topology(smi, 15.0)
+    # One plain query carries the PCIe link fields, the clocks and the persistence mode together. `-d PCIE` is not a
+    # display type this driver accepts (595.91.07 lists neither PCIE nor PERSISTENCE), so a `-d` query would report
+    # every field unavailable on a card that can answer the question. It stays one bounded, read-only command.
+    rows = _query(smi, ["-q"], 25.0)
+    if rows:
+        out["pcie"] = _pick(rows, ("pci_bus_id", "pci_gpu_link_info_"))   # the link fields, not the traffic counters
+        out["clocks"] = _pick(rows, ("clocks_", "max_clocks_", "performance_state", "persistence_mode"))
+    return out
 
 
 # --------------------------------------------------------------------------- processor

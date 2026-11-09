@@ -3699,17 +3699,55 @@ def parallel_stack_platform() -> bool:
     return sys.platform.startswith("linux")
 
 
+def parallel_stack_active(cfg: dict) -> bool:
+    """Whether this run uses the stack: batch slots, not DeepSeek, a CUDA backend, Linux.  The switch and its log line
+    both call this one predicate, in this one order, so the line can never say the stack is on when it is off (or the
+    reverse).  HIP is out: its only run was inside the replica config, so nothing measured it alone."""
+    if parallel_slots(cfg) < 2:
+        return False
+    if (cfg.get("arch") or "") == "deepseek41":
+        return False
+    if cfg.get("backend") in ("sycl", "metal", "vulkan"):
+        return False
+    if not parallel_stack_platform():
+        return False
+    return cfg.get("backend") != "hip"
+
+
 def parallel_stack_env(env: dict, cfg: dict) -> None:
     """Switch the exact parallel stack on (setdefault: a value the user or the config set stays) when the config runs batch
-    slots on a CUDA or HIP Qwen engine.  Other engines (DeepSeek, SYCL, Metal) do not read these."""
-    if parallel_slots(cfg) < 2 or (cfg.get("arch") or "") == "deepseek41" or cfg.get("backend") in ("sycl", "metal", "vulkan"):
-        return
-    if not parallel_stack_platform():
-        return
-    if cfg.get("backend") == "hip":
+    slots on a CUDA Qwen engine.  Other engines (DeepSeek, SYCL, Metal, HIP) do not read these."""
+    if not parallel_stack_active(cfg):
         return
     for k, v in PARALLEL_STACK_ENV.items():
         env.setdefault(k, v)
+
+
+def parallel_stack_note(cfg: dict, env: dict | None = None) -> str | None:
+    """One startup line naming what the batch stack is set on: the card class this run uses and how many of the nine
+    switches it actually set.  `env` is the environment the run will hand the engine, so a value the user or the config
+    already chose (``setdefault`` keeps it) is counted as not set here.  None when the stack is not active: there is
+    nothing to report then.  A card class this query cannot read is said to be unknown, never guessed."""
+    if not parallel_stack_active(cfg):
+        return None
+    if env is None:
+        where = "GPU compute capability unknown"
+        count = len(PARALLEL_STACK_ENV)
+    else:
+        caps = nvidia_compute_caps() or {}
+        used = gpu_list(cfg)
+        if not caps or (used and any(i not in caps for i in used)):
+            where = "GPU compute capability unknown"
+        elif not used:
+            where = ", ".join(f"sm_{c}" for c in sorted(set(caps.values())))
+        else:
+            where = ", ".join(f"sm_{c}" for c in sorted({caps[i] for i in used}))
+        kept = [k for k, v in PARALLEL_STACK_ENV.items() if env.get(k) != v]
+        count = len(PARALLEL_STACK_ENV) - len(kept)
+    line = f"[strata] Linux CUDA batch stack active on {where}; {count} of {len(PARALLEL_STACK_ENV)} switches set"
+    if env is not None and kept:
+        line += " (already set by you: " + ", ".join(kept) + ")"
+    return line + "."
 
 
 # 0.2.9: the qualified GDN prompt speedups (QUAL-GDN, Qwen3.8 IQ3_S).  Linux only.
@@ -3878,6 +3916,17 @@ def card_note(cfg: dict, env: dict) -> str | None:
             f"{', '.join(names)} - the first runs the first layers and the picture reader, the last runs the head and the draft layer")
 
 
+def nvidia_compute_caps() -> dict[int, int] | None:
+    """``{nvidia-smi number: compute capability x 10}`` from one read-only query, or None when nvidia-smi cannot say.
+    One parser for every note that names a card class (a third copy would be a third bug)."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=index,compute_cap", "--format=csv,noheader"], capture_output=True,
+                           text=True, errors="replace", timeout=10)
+        return {int(i): int(round(float(c) * 10)) for i, c in (ln.split(",") for ln in (r.stdout or "").strip().splitlines())}
+    except Exception:
+        return None
+
+
 def engine_arch_note(cfg: dict, cards: dict[int, int] | None = None, built: dict | None = None) -> str | None:
     """#4662: a compiled engine holds code for the architectures it was built for (BUILD.json "archs"); on a card of another one a long prompt
     ends in "unspecified launch failure" (the kernels it needs are a trap there).  One plain line when a card this run uses is not covered
@@ -3895,9 +3944,9 @@ def engine_arch_note(cfg: dict, cards: dict[int, int] | None = None, built: dict
         if not archs:
             return None
         if cards is None:
-            r = subprocess.run(["nvidia-smi", "--query-gpu=index,compute_cap", "--format=csv,noheader"], capture_output=True, text=True,
-                               errors="replace", timeout=10)
-            cards = {int(i): int(round(float(c) * 10)) for i, c in (ln.split(",") for ln in (r.stdout or "").strip().splitlines())}
+            cards = nvidia_compute_caps()
+            if cards is None:
+                return None
         used = gpu_list(cfg) or sorted(cards)
         miss = sorted({cards[i] for i in used if i in cards and cards[i] not in archs and not (built.get("ptx") and cards[i] > max(archs))})
         if not miss:
@@ -9231,6 +9280,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         arch_line = engine_arch_note(cfg)
         if arch_line:
             print(arch_line, flush=True)
+        stack_line = parallel_stack_note(cfg, env)
+        if stack_line:
+            print(stack_line, flush=True)
         igpu_line = igpu_split_warning(cfg)
         if igpu_line:
             print(igpu_line, flush=True)
