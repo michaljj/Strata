@@ -200,6 +200,8 @@ static int pick_iq1m() {
         // bench's stream, and at that size the rows' advantage at 6 tokens does not materialise (measured: a 4-token
         // threshold cost 6.1% decode against taking ggml's dot outright, /tmp/hyb-ab.log).  So the rule is: take the
         // rows only when they already win at ONE token, otherwise ggml's dot throughout.
+        // (v0.2.13, agent decode over 2 runs each: own rows 33.25 against ggml's dot 34.75 - 4.5%, the same direction the bench's GB/s
+        // measure; the c62d5e3a base read -6.5%.  The probe prints both numbers every start, so the choice stays visible and reversible.)
         g_iq1m_own_from = b1o < b1g ? 1 : (1 << 20);
         g_iq1m = g_iq1m_own_from <= 1 ? 1 : 0;
         std::fprintf(stderr,

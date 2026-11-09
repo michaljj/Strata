@@ -8287,8 +8287,10 @@ const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
         // last part, instead of after a barrier - so the quantisation of the experts already done overlaps the gate/up of
         // the ones still running, and the pool never idles between the two phases.  Bit-identical: the quantisation of an
         // expert depends only on that expert's own h rows, and run_nodes' end still orders it before the down dispatch.
-        // default on (measured -3.2% decode at 32K: 4206 -> 4072 ms median over two interleaved pairs); DS4_LANE_FUSE=0 turns it off
-        static const bool fuse = [] { const char* v = std::getenv("DS4_LANE_FUSE"); return v == nullptr || (std::atoi(v) != 0); }();
+        // opt-in: -3.2% decode on the c62d5e3a base (4206 -> 4072 ms), no effect on v0.2.13 (agent decode 34.7 off against 34.8 on,
+        // 2 runs each; the ids-path bracket read +1.6%, inside a 7.7% spread).  The rebased engine is what ships, so the default is off
+        // until a stable measurement says otherwise: DS4_LANE_FUSE=1 turns it on.
+        static const bool fuse = [] { const char* v = std::getenv("DS4_LANE_FUSE"); return v != nullptr && std::atoi(v) != 0; }();
         std::vector<std::atomic<int>> parts_done((size_t) ne);
         for (auto& c : parts_done) c.store(0, std::memory_order_relaxed);
         for (int X = 0; X < NH; ++X)
